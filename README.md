@@ -1,122 +1,177 @@
-# daily-sip-warm-transfer
+# Daily SIP warm transfer (Pipecat)
 
-A bring-your-own-carrier voice agent: inbound SIP call -> OpenSIPS -> Daily room -> Pipecat agent, with a **warm transfer** that dials a human back out through your own trunk and puts both parties into the same room.
-
-No telephony account, phone number or scenario is baked in. Everything is environment driven.
+Voice agent that answers a phone call, talks to the caller, and transfers them to a
+human — but only after that human has heard a short briefing and agreed to take the
+call. Built with [Pipecat](https://github.com/pipecat-ai/pipecat) on a Daily room with
+a BYOC SIP trunk in front of it.
 
 ```
-caller ──PSTN──► carrier ──SIP──► OpenSIPS :5080 ──► Daily room (SIP dial-in URI)
-                                                        │
-                                                        ├─► agent (Deepgram STT / LLM / Inworld TTS)
-                                                        │
-"connect me"  ──► hold prompt ──► Daily dialOut (REST) ──► OpenSIPS ──► carrier ──► human
-                                                                                   │
-                                        human joins the same room, agent mutes ◄───┘
+caller ──SIP──▶ carrier ──▶ SBC / OpenSIPS ──SIP──▶ Daily room ──▶ Pipecat agent
+                                                          │            (STT→LLM→TTS)
+                                                          └──▶ SIP leg: the human
 ```
 
-## Why this repo exists
+## What the agent does
 
-Most "SIP + voice agent" tutorials stop at inbound audio. Making the transfer leg work against a real carrier is where the time goes. This repo documents the four traps that cost the most:
+1. Greets the caller with a pre-generated opener (spoken from an audio file, so no
+   TTS latency on the first turn).
+2. Answers questions using the LLM. If the caller asks for the boss, the LLM calls
+   `transfer_to_boss(briefing)` and writes a one-or-two-sentence briefing.
+3. Tells the caller to wait and starts **hold music for the caller only**.
+4. Dials the human through the Daily REST API (`dialOut`) and waits for an answer.
+5. When the human picks up, the hold music stops for them, the briefing is read
+   **only to them**, followed by "Shall I connect the caller now?".
+6. `yes` → caller's audio is released, the agent says "connecting you" and then goes
+   silent; the two parties talk directly.
+   `no` → the human's leg is ejected and the caller is taken back.
+   No answer within `TRANSFER_TIMEOUT_S` (default 45 s) → back to the caller.
 
-| # | Trap | Symptom | Fix |
-|---|------|---------|-----|
-| 1 | Daily dial-out requires an **owner** participant | `Dialout(Properties(UserMustBeAdmin))`, no call ever leaves | create a meeting token with `is_owner: true` and pass it as the second `DailyTransport` argument |
-| 2 | The Python/JS SDKs **silently drop `codecs`** | carrier answers `488 Not Acceptable Here` | start the leg through the REST endpoint `POST /v1/rooms/{room}/dialOut/start`, which honours `codecs` |
-| 3 | Daily offers **`RTP/AVPF`** | `488` for every codec (G.722, PCMU, PCMA all tested) | rewrite the SDP profile to `RTP/AVP` in the proxy: `subst_body('/RTP\/AVPF/RTP\/AVP/g')` |
-| 4 | Trunk registration lives in the **registrant table** | inbound works after a restart, then dies | `uac_registrant` + `timer_interval`, verify `REGISTER 401 -> 200 OK` |
+Two rules shaped the whole design:
 
-Trap 3 is the interesting one: the codec is a red herring. `488 Not Acceptable Here` looks like a codec mismatch, but a direct INVITE with the same codec in a plain `RTP/AVP` offer goes straight through `100 -> 183 -> 200`.
+* the caller must never hear the briefing or the human's decision, only hold music;
+* the human decides verbally — the agent waits for an answer, it does not bridge on
+  its own.
+
+## Hold music without a second track
+
+Custom audio tracks are not forwarded to SIP legs: a SIP participant only ever
+receives the **microphone** track of the other participants. Publishing hold music on
+a custom track therefore works in the browser and stays silent on the phone.
+
+So the music is published by a **second Daily participant** (`moh_agent.py`) that
+publishes the loop as its microphone. The agent controls who may receive it with
+per-participant permissions:
+
+```
+caller : microphone=false, byParticipantId {moh-hold: microphone=true}
+human  : microphone=true,  byParticipantId {moh-hold: microphone=false}
+```
+
+A receiver map that only contains `{"*": ...}` is not enough — the per-participant
+entries are what isolate the music.
+
+### The lease file
+
+`moh_agent.py` never trusts its own state. The agent writes `on`/`off` plus a
+heartbeat into `$MOH_STATE_FILE` once per second; the music player only plays when the
+content is `on` **and** the file is younger than 3 s. A crashed agent, a restart or a
+call that dies mid-transfer can never leave the music running into the next call.
+
+## Turn detection
+
+Pipecat's user aggregator closes a turn on the STT's proposals. Speechmatics in
+`EXTERNAL` mode closes a turn when it receives `VADUserStoppedSpeakingFrame`; the
+provider's own sentence segmentation is disabled (`emit_sentences=False`), otherwise
+every sentence becomes its own LLM call:
+
+```
+without VAD   "Hallo. Wie geht es Ihnen heute?"  → turn
+              "Ich."                             → turn
+              "Wollte nur kurz fragen."          → turn
+with VAD      "Hallo. Wie geht es Ihnen heute? Ich wollte nur kurz fragen." → one turn
+```
+
+`EnergyVAD` (in `bot.py`) sits directly in front of the STT and emits the VAD frames:
+adaptive threshold from the 10th percentile of the last 5 s (floor `max(600,
+2.5 × noise)`), 900 ms hangover. That is deliberately provider-independent — it also
+works when the pipeline runs with Deepgram.
+
+## Speech recognition
+
+`STT_PROVIDER=speechmatics` (default) or `deepgram`. Measured on 16 kHz phone audio
+(8 kHz G.711, upsampled), German, four sentences:
+
+```
+speechmatics linden-1 : "Hallo. Wie geht es Ihnen heute? Ich wollte nur kurz fragen."
+deepgram     nova-3   : "Hallo, wie geht es Ihnen heute? Ich wollte nur kurz"
+```
+
+Timing inside the room (caller side, one utterance):
+
+```
+speech end            → VAD stop           900 ms hangover
+VAD stop              → transcript         286 ms
+transcript            → first bot audio    1.4 s   (LLM + TTS)
+```
 
 ## Files
 
-```
-bot.py                     Pipecat agent: greeting, tool call, hold prompt, dial-out, mute gate, watchdog
-opensips/opensips.cfg      Minimal proxy: trunk registration, inbound leg, transfer leg (+ AVPF rewrite)
-scripts/sip_probe.py       Send a raw INVITE with a chosen codec and print the full reply chain
-systemd/pipecat-agent.service
-.env.example
-```
+| file | role |
+| --- | --- |
+| `bot.py` | the agent: pipeline, tool, transfer state machine, hold-music control |
+| `moh_agent.py` | second Daily participant that publishes the hold loop |
+| `scripts/make_moh.py` | turns any music file into a seamless 16 kHz mono loop |
+| `scripts/sip_probe.py` | sends OPTIONS/INVITE to check the SIP side |
+| `opensips/opensips.cfg` | SBC config, incl. the SDP `RTP/AVPF` → `RTP/AVP` rewrite |
+| `systemd/pipecat-agent.service`, `systemd/moh-agent.service` | units |
 
-## Quick start
-
-```bash
-# 1. agent
-python3.11 -m venv venv && ./venv/bin/pip install pipecat-ai[daily,deepgram,openai,silero] aiohttp
-cp .env.example .env && $EDITOR .env          # room URL, owner token, transfer target, keys
-set -a; . ./.env; set +a
-./venv/bin/python bot.py
-
-# 2. proxy
-sudo cp opensips/opensips.cfg /etc/opensips/opensips.cfg   # edit the defines first
-sudo opensips -C -f /etc/opensips/opensips.cfg
-sudo systemctl restart opensips
-
-# 3. prove the transfer leg without ringing anybody
-python scripts/sip_probe.py <carrier-ip> 5060 4930000000 pcma
-#   488 -> SDP profile still AVPF     183/200 -> leg is fine
-```
-
-## Environment
-
-| Variable | Required | Meaning |
-|---|---|---|
-| `DAILY_ROOM_URL` | yes | `https://<domain>.daily.co/<room>` |
-| `DAILY_API_KEY` | yes | REST key, used for the dial-out call |
-| `DAILY_TOKEN` | yes | meeting token with `is_owner: true` (trap 1) |
-| `TRANSFER_TARGET` | yes | SIP URI of the human, e.g. `sip:+15551234567@carrier.example` |
-| `DEEPGRAM_API_KEY` / `INWORLD_API_KEY` / `INWORLD_VOICE` / `LLM_API_KEY` | yes | STT / TTS / LLM |
-| `LLM_BASE`, `LLM_MODEL`, `STT_MODEL`, `TTS_MODEL`, `STT_LANGUAGE` | no | provider overrides |
-| `SYSTEM_PROMPT`, `OPENER_TEXT`, `HOLD_TEXT`, `FAIL_TEXT` | no | wording; keep your own voice here, never hardcode a scenario in the code |
-| `TRANSFER_TIMEOUT_S` | no | seconds before the agent comes back to the caller (default 45) |
-
-## Behaviour
-
-* Greeting only for the first participant; the human joining later does not get greeted.
-* After the tool call the agent speaks the hold prompt and **only then** starts the dial-out, so the caller is never left in silence.
-* Both audio gates close as soon as the human leg is started: the agent stays silent during the conversation and does not transcribe it.
-* If nobody answers within `TRANSFER_TIMEOUT_S`, the gates reopen and the agent asks the caller again.
-* `+` prefix matters: E.164 with `+` is accepted by most carriers, bare digits are often rejected with `404`.
-
-## Hold music on a separate track
-
-While the human gets the briefing, the caller should keep hearing hold music - and only the caller, not the human. Both can sit in the same Daily room, because Daily lets you publish more than one audio track and hand out permissions per track.
-
-```text
-track "microphone"  (Pipecat output)  -> TTS: greeting, hold prompt, briefing
-track "moh"         (own publisher)   -> hold music loop
-
-caller during briefing   canReceive: microphone=false, customAudio={"*": false, "moh": true}
-human during briefing    canReceive: microphone=true,  customAudio={"*": true,  "moh": false}
-caller after "yes"       canReceive: microphone=true,  customAudio={"*": true,  "moh": false}
-```
-
-Notes that cost time to find out:
-
-* `canReceive` takes a **map**, `false` is rejected (`invalid type: boolean 'false', expected a map`).
-* Inside `customAudio`/`customVideo` the `'*'` key is mandatory (`missing field '*' key`). An empty `{}` is rejected, `{"byUserId": {}}` is accepted but filters nothing.
-* Publish the extra track **when the agent joins the room**, not when the first caller connects: participants subscribe to the tracks that exist at their join, a later track never reaches them.
-* The loop is 16 kHz mono s16 (`hold16.wav`), written in 20 ms chunks; frames keep flowing as silence while the track is idle, so the publisher is not torn down between calls.
-* The file must be normalised. A loop peaking at 622/32768 (`-34 dBFS`) is inaudible on a phone line.
-
-The agent keeps the caller on hold until the closing sentence has left the pipeline (`BotStoppedSpeakingFrame`), then flips the permissions and drops the music - otherwise the caller still hears the last words.
-
-## Diagnostics
+## Setup
 
 ```bash
-# what the carrier answered for a single dial-out
-journalctl -u opensips -f | grep -E "INVITE sip|SIP/2.0 [0-9]{3}"
-
-# registration state
-mysql -N -B opensips -e "SELECT id,state,expiry FROM registrant;"
+python3 -m venv venv && . venv/bin/activate
+pip install "pipecat-ai[daily,speechmatics,deepgram,inworld,openai,silero]"
+cp .env.example .env      # fill in the keys
 ```
 
-| Reply | Meaning |
-|---|---|
-| `488 Not Acceptable Here` | SDP profile rejected (AVPF) - see trap 3 |
-| `404 Invalid phone number` | number format or trunk authorization rejected |
-| `403 Forbidden` | From/CLI not allowed for this trunk |
-| `Dialout(Properties(UserMustBeAdmin))` | missing owner token - see trap 1 |
+Requirements: a Daily room, a Daily API key, a meeting token with
+`{"properties": {"is_owner": true}}` (the REST `dialOut` call needs an owner token),
+a SIP trunk that terminates on your SBC, and the usual provider keys.
 
-## License
+```bash
+set -a && . ./.env && set +a
+python bot.py             # terminal 1
+python moh_agent.py       # terminal 2
+```
 
-MIT
+## Configuration
+
+See `.env.example`. The important ones:
+
+| variable | meaning |
+| --- | --- |
+| `DAILY_ROOM_URL`, `DAILY_API_KEY`, `DAILY_TOKEN` | room and owner token |
+| `CHEF_SIP` | SIP URI of the human, in the carrier's expected format |
+| `TRANSFER_TIMEOUT_S` | how long to ring before falling back to the caller |
+| `STT_PROVIDER` | `speechmatics` or `deepgram` |
+| `STT_LANGUAGE`, `SPEECHMATICS_MODEL`, `DEEPGRAM_MODEL` | recognition model |
+| `VAD_RMS`, `VAD_HANGOVER_MS` | energy VAD threshold (`0` = adaptive) and hangover |
+| `LLM_BASE`, `LLM_API_KEY`, `LLM_MODEL` | any OpenAI-compatible endpoint |
+| `HOLD_MUSIC_WAV16` | the loop, 16 kHz mono s16 |
+
+Wording lives in the environment, not in the code: `OPENER_TEXT`, `HOLD_TEXT`,
+`FAIL_TEXT`, `BOT_NAME`.
+
+## Building a hold loop
+
+```bash
+python scripts/make_moh.py input.mp3 hold16.wav
+```
+
+The script finds the musical period by autocorrelation, crossfades the seam, applies
+8 ms edge fades (a loop seam that jumps by more than ~0.1 in sample value is audible
+as a click) and normalises to −18 LUFS, −2 dBFS peak.
+
+## Verification
+
+What the logs should show for one transfer:
+
+```
+VAD stop: Stille 902 ms, Turn 1
+VERSTANDEN: <the full utterance, one transcript>
+Wartemusik an                    (caller only)
+dialOut -> 200
+DialoutAnsweredFrame             -> Briefing an den Chef, Musik bleibt beim Anrufer
+Chef: ja                          -> Wartemusik aus, Rechte frei, "Ich verbinde Sie"
+BotStoppedSpeakingFrame           -> Brücke steht, Bot verstummt
+```
+
+## Limitations
+
+* One caller per room; the transfer state machine is global (`STATE`).
+* The briefing quality depends on the LLM's tool-call arguments — the prompt asks for
+  facts only ("invent nothing"), but it is not validated.
+* `dialOut` needs an owner meeting token; a normal token is rejected.
+* Codec negotiation is left to the carrier: the SBC rewrites `RTP/AVPF` to `RTP/AVP`
+  because several trunks reject AVPF with `488 Not Acceptable Here`.
+
+MIT licensed.

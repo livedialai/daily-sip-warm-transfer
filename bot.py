@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Pipecat-Agent am vsip-Trunk: Begruessung + Warmtransfer mit Briefing und Rueckfrage.
+"""Pipecat agent on a BYOC SIP trunk: greeting + warm transfer with briefing and approval.
 
-DID -> vsip -> OpenSIPS:5080 -> Daily-Room (SIP-URI)
-Bot im Raum: Deepgram (STT) / DeepSeek via melious (LLM) / Inworld (TTS)
+DID -> SIP carrier -> SBC (OpenSIPS:5080) -> Daily room (SIP URI)
+Bot in the room: Speechmatics linden-1 / Deepgram (STT), OpenAI-compatible LLM, Inworld (TTS)
 
-Ablauf Transfer (nach Pipecat-Referenz daily-pstn-warm-transfer):
-  1. Anrufer will zum Chef -> Tool mit_chef_verbinden(briefing)
-  2. Ansage an den Anrufer, danach Hold-Musik (SoundfileMixer) an
-  3. dialOut per REST (Codec/AVPF-Fix braucht den REST-Weg)
-  4. Chef nimmt ab -> Musik aus, Bot liest dem Chef das Briefing vor und fragt:
-     "Soll ich den Anrufer jetzt verbinden?"
-  5. Chef sagt ja  -> Ansage "Ich verbinde", Bot verstummt, beide hoeren sich
-     Chef sagt nein -> Chef-Bein wird getrennt (eject), zurueck zum Anrufer
-  6. Keine Abnahme nach 45 s oder keine Entscheidung -> zurueck zum Anrufer
+Transfer flow (following the pipecat example daily-pstn-warm-transfer):
+  1. Caller asks for the boss -> tool mit_chef_verbinden(briefing)
+  2. Announcement to the caller, then hold music on (published by moh_agent.py)
+  3. dialOut through the REST API (codec/AVPF handling needs that path)
+  4. The human picks up -> music off, the bot reads the briefing to them and asks
+     "Shall I connect the caller now?"
+  5. yes  -> "connecting you", the bot goes silent, both parties hear each other
+     no   -> the human's leg is ejected, back to the caller
+  6. No answer after 45 s or no decision -> back to the caller
 """
 import asyncio
+import collections
 import os
 import re
 import sys
@@ -35,6 +36,8 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -46,6 +49,9 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.speechmatics.stt import SpeechmaticsSTTService
+from pipecat.services.speechmatics.stt import TurnDetectionMode as SMTurnMode
+from speechmatics.agent_stt import AdditionalVocabEntry
 from pipecat.services.inworld.tts import InworldTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
@@ -65,11 +71,15 @@ LLM_BASE = os.environ.get("LLM_BASE", "https://api.melious.ai/v1")
 LLM_KEY = os.environ["LLM_API_KEY"]
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4.1-flash")
 HOLD_WAV = os.environ.get("HOLD_MUSIC_WAV", "/opt/pipecat-bot/hold_music.wav")
+KEYTERMS = ["Chef", "verbinden", "Rückruf", "Bestellung", "Lieferung", "Termin"]
+MOH_STATE_FILE = os.environ.get("MOH_STATE_FILE", "/tmp/moh.state")
+MOH_USER = "moh-hold"
 HOLD_WAV16 = os.environ.get("HOLD_MUSIC_WAV16", "/opt/pipecat-bot/hold16.wav")
 
-OPENER = "Wie kann ich Ihnen helfen?"
-HOLD = "Einen Moment bitte, ich verbinde Sie mit dem Chef."
-FAIL = "Ich konnte den Chef gerade nicht erreichen. Kann ich sonst etwas für Sie tun?"
+BOT_NAME = os.getenv("BOT_NAME") or "Telefonassistenz"
+OPENER = os.getenv("OPENER_TEXT") or "Wie kann ich Ihnen helfen?"
+HOLD = os.getenv("HOLD_TEXT") or "Einen Moment bitte, ich verbinde Sie mit dem Chef."
+FAIL = os.getenv("FAIL_TEXT") or "Ich konnte den Chef gerade nicht erreichen. Kann ich sonst etwas für Sie tun?"
 BUSY = "Der Chef hat gerade keine Zeit. Kann ich Ihnen sonst weiterhelfen?"
 BRIEF_INTRO = "Chef, hier ist die Telefonassistenz."
 BRIEF_QUESTION = "Soll ich den Anrufer jetzt verbinden?"
@@ -141,15 +151,129 @@ async def daily_dialout(sip_uri: str):
         "provider": "daily",
         "codecs": {"audio": ["PCMA", "PCMU"]},
     }
-    async with aiohttp.ClientSession() as sess:
-        async with sess.post(
-            url, json=payload, headers={"Authorization": f"Bearer {DAILY_API_KEY}"}
-        ) as r:
-            try:
-                data = await r.json(content_type=None)
-            except Exception:
-                data = {"raw": await r.text()}
-            return r.status, data
+    async def _post_once():
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                url, json=payload, headers={"Authorization": f"Bearer {DAILY_API_KEY}"}
+            ) as r:
+                try:
+                    data = await r.json(content_type=None)
+                except Exception:
+                    data = {"raw": await r.text()}
+                return r.status, data
+
+    status, data = await _post_once()
+    if status == 400 and "active" in str(data).lower():
+        # Ein Dialout eines abgebrochenen Anrufs haengt noch: kurz warten, dann erneut.
+        logger.warning("dialout bereits aktiv -> 2 s warten, zweiter Versuch")
+        await asyncio.sleep(2.0)
+        status, data = await _post_once()
+    return status, data
+
+
+class EnergyVAD(FrameProcessor):
+    """Energie-VAD: schliesst Sprech-Turns (fuer Speechmatics EXTERNAL).
+
+    Silero laeuft in dieser Pipecat-Version nicht im Transport, deshalb
+    entscheidet hier die Frame-Energie: Sprache ab VAD_RMS, Turn-Ende nach
+    VAD_HANGOVER_MS ohne Pegel.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.thresh_min = int(os.getenv("VAD_RMS", "600"))
+        self.hang = float(os.getenv("VAD_HANGOVER_MS", "900")) / 1000.0
+        self.speaking = False
+        self.last_voice = 0.0
+        self.turns = 0
+        self.hist = collections.deque(maxlen=250)   # ~5 s Frame-Pegel
+        self.noise = 120.0
+        self.cnt = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and frame.audio:
+            import array as _arr
+            a = _arr.array("h")
+            data = frame.audio
+            a.frombytes(data[: len(data) // 2 * 2])
+            if a:
+                peak = max(abs(min(a)), abs(max(a)))
+                now = time.monotonic()
+                # Rauschboden: 10-Perzentil der letzten ~5 s, Schwelle = 2,5x Rauschen
+                self.hist.append(peak)
+                self.cnt += 1
+                if self.cnt % 5 == 0 and self.hist:
+                    h = sorted(self.hist)
+                    self.noise = float(h[len(h) // 10])
+                thr = max(self.thresh_min, self.noise * 2.5)
+                if peak >= thr:
+                    self.last_voice = now
+                    if not self.speaking:
+                        self.speaking = True
+                        logger.debug("VAD start peak={} thr={:.0f} noise={:.0f}", peak, thr, self.noise)
+                        await self.push_frame(VADUserStartedSpeakingFrame())
+                elif self.speaking and (now - self.last_voice) >= self.hang:
+                    self.speaking = False
+                    self.turns += 1
+                    logger.info(
+                        "VAD stop: Stille {:.0f} ms, Turn {}".format(
+                            (now - self.last_voice) * 1000, self.turns
+                        )
+                    )
+                    await self.push_frame(VADUserStoppedSpeakingFrame(stop_secs=self.hang))
+        await self.push_frame(frame, direction)
+
+
+class Probe(FrameProcessor):
+    """Diagnose: zaehlt ankommende Audio-Frames und Transkripte."""
+
+    def __init__(self, label: str, **kwargs):
+        super().__init__(**kwargs)
+        self.label = label
+        self.audio = 0
+        self.texts = 0
+        self.peak = 0
+        self.sum_sq = 0
+        self.n = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            self.audio += 1
+            if getattr(self, "srate", None) != frame.sample_rate:
+                self.srate = frame.sample_rate
+                logger.info("AUDIO-RATE: {} Hz, {} Kanaele", frame.sample_rate, frame.num_channels)
+            data = frame.audio or b""
+            if data:
+                import array as _arr
+                a = _arr.array("h")
+                a.frombytes(data[: len(data) - (len(data) % 2)])
+                if a:
+                    self.peak = max(self.peak, max(abs(x) for x in a))
+                    self.sum_sq += sum(x * x for x in a)
+                    self.n += len(a)
+        elif isinstance(frame, TranscriptionFrame):
+            self.texts += 1
+            logger.info("{} Transkript: {}", self.label, (frame.text or "")[:120])
+        await self.push_frame(frame, direction)
+
+
+class TransLog(FrameProcessor):
+    """Loggt jedes finale Transkript, damit sichtbar ist, was verstanden wurde."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.last = ""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            t = (frame.text or "").strip()
+            if t and t != self.last:
+                self.last = t
+                logger.info("VERSTANDEN: {}", t)
+        await self.push_frame(frame, direction)
 
 
 class Gate(FrameProcessor):
@@ -190,83 +314,69 @@ class ChefWatch(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-class MohTrack:
-    """Eigener Daily-Audio-Track 'moh'.
+class MohControl:
+    """Wartemusik laeuft in einem eigenen Teilnehmer (moh_agent.py).
 
-    Der Anrufer darf per Permissions nur diesen Track empfangen, der Chef nur
-    den normalen Mikrofon-Track (Briefing). Damit laufen Wartemusik beim Anrufer
-    und Briefing beim Chef gleichzeitig, ohne sich zu vermischen.
+    Der Bot gibt nur einen Leash aus: solange er alle Sekunde "on"
+    schreibt, spielt der Agent. Bleibt der Heartbeat aus (Crash,
+    Neustart, haengender Call), stellt der Agent nach 3 s selbst ab.
     """
 
-    def __init__(self, path: str, sample_rate: int = 16000, chunk_ms: int = 20):
+    def __init__(self, path: str):
         self.path = path
-        self.sample_rate = sample_rate
-        self.chunk = int(sample_rate * 2 * chunk_ms / 1000)
         self.on = False
-        self._src = None
         self._task = None
-        self._pcm = b""
 
-    def _load(self):
-        with wave.open(self.path, "rb") as w:
-            if w.getframerate() != self.sample_rate or w.getnchannels() != 1:
-                logger.warning("MOH: {} Hz/{} ch != {} Hz/1 ch", w.getframerate(), w.getnchannels(), self.sample_rate)
-            self._pcm = w.readframes(w.getnframes())
-            import array as _arr
-            a = _arr.array("h"); a.frombytes(self._pcm)
-            logger.info("MOH-Datei: {} s, peak={}", round(len(a) / self.sample_rate, 2), max((abs(x) for x in a), default=0))
+    def _write(self, on: bool):
+        try:
+            with open(self.path, "w") as f:
+                f.write("on" if on else "off")
+        except OSError as e:
+            logger.error("MOH-Status nicht schreibbar: {}", e)
 
-    async def attach(self, client):
-        if self._src is not None:
-            return
-        if not self._pcm:
-            self._load()
-        from pipecat.transports.daily.transport import DailyCustomAudioTrackParams
-
-        track = await client.add_custom_audio_track(
-            "moh", DailyCustomAudioTrackParams(sample_rate=self.sample_rate, channels=1)
-        )
-        self._src = track.source
-        self._task = asyncio.create_task(self._loop())
-        logger.info("MOH-Track 'moh' angelegt ({} Hz, {} Bytes)", self.sample_rate, len(self._pcm))
-
-    async def _loop(self):
-        data = self._pcm
-        if not data:
-            return
-        pos = 0
-        silence = b"\x00" * self.chunk
-        step = self.chunk / (self.sample_rate * 2)
+    async def _beat(self):
         while True:
-            if self.on:
-                buf = data[pos:pos + self.chunk]
-                pos += self.chunk
-                if len(buf) < self.chunk:
-                    buf = (buf + data)[: self.chunk]
-                    pos = self.chunk - len(buf) if False else pos
-                if pos >= len(data):
-                    pos = 0
-            else:
-                buf = silence
-            try:
-                self._src.write_frames(buf)
-            except Exception as e:  # noqa: BLE001
-                logger.error("MOH write_frames: {}", e)
-                return
-            await asyncio.sleep(step)
+            self._write(True)
+            await asyncio.sleep(1.0)
+
+    def set(self, on: bool):
+        self.on = on
+        if on:
+            self._write(True)
+            if not self._task or self._task.done():
+                self._task = asyncio.create_task(self._beat())
+        else:
+            if self._task:
+                self._task.cancel()
+                self._task = None
+            self._write(False)
 
 
 async def main():
-    moh = MohTrack(HOLD_WAV16)
+    moh = MohControl(MOH_STATE_FILE)
+
+    async def mute_moh_for_bot(mute: bool):
+        """Bot selbst darf die Musik nicht hoeren (sonst landet sie in der STT)."""
+        mp = moh_pid()
+        if not mp:
+            return
+        try:
+            err = await transport.update_subscriptions(
+                participant_settings={mp: {"microphone": not mute}}
+            )
+            logger.info("Bot-Abo Wartemusik {} -> {}", "aus" if mute else "an", err or "ok")
+        except Exception as e:  # noqa: BLE001
+            logger.error("update_subscriptions: {}", e)
 
     def moh_on(on: bool):
-        moh.on = on
+        moh.set(on)
         logger.info("Wartemusik {}", "an" if on else "aus")
+        asyncio.create_task(mute_moh_for_bot(on))
 
     transport = DailyTransport(
         ROOM_URL,
         DAILY_TOKEN,
-        "Telefonassistenz",
+        BOT_NAME,
         DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
@@ -274,10 +384,53 @@ async def main():
         ),
     )
 
-    stt = DeepgramSTTService(
-        api_key=DG_KEY,
-        settings=DeepgramSTTService.Settings(model="nova-3", language="de"),
-    )
+    # Wichtig: sample_rate/encoding muessen explizit gesetzt sein. Ohne Angabe
+    # schickt Pipecat "None" an Deepgram, Deepgram nimmt 16 kHz an, wir senden
+    # aber die Pipeline-Rate (24 kHz) -> keine Transkripte.
+    IN_RATE = 16000
+    try:
+        IN_RATE = int(transport.audio_in_sample_rate or 16000)
+    except Exception:
+        pass
+    logger.info("STT-Rate (Pipeline-Eingang): {} Hz", IN_RATE)
+    STT_PROVIDER = (os.getenv("STT_PROVIDER") or "speechmatics").strip().lower()
+    STT_LANG = os.getenv("STT_LANGUAGE") or "de"
+    if STT_PROVIDER == "speechmatics":
+        # linden-1 = Speechmatics Agent-STT-Modell, auf Telefon-Audio (16 kHz) deutlich
+        # praeziser als nova-3. Turn-Ende kommt von unserem EnergyVAD (EXTERNAL).
+        vocab = [
+            AdditionalVocabEntry(content=w) for w in KEYTERMS
+        ]
+        stt = SpeechmaticsSTTService(
+            api_key=os.getenv("SPEECHMATICS_API_KEY"),
+            sample_rate=IN_RATE if IN_RATE in (8000, 16000) else 16000,
+            settings=SpeechmaticsSTTService.Settings(
+                language=STT_LANG,
+                model=os.getenv("SPEECHMATICS_MODEL") or "linden-1",
+                enable_partials=True,
+                emit_sentences=False,
+                turn_detection_mode=SMTurnMode.EXTERNAL,
+                additional_vocab=vocab,
+            ),
+        )
+        logger.info("STT: Speechmatics {} ({}), {} Hz, Turn=EXTERNAL", os.getenv("SPEECHMATICS_MODEL") or "linden-1", STT_LANG, IN_RATE)
+    else:
+        stt = DeepgramSTTService(
+            api_key=DG_KEY,
+            sample_rate=IN_RATE,
+            settings=DeepgramSTTService.Settings(
+                model=os.getenv("DEEPGRAM_MODEL") or "nova-3",
+                language=STT_LANG,
+                interim_results=True,
+                punctuate=True,
+                smart_format=True,
+                numerals=True,
+                endpointing=300,
+                keyterm=KEYTERMS,
+            ),
+        )
+        logger.info("STT: Deepgram {} ({}), {} Hz", os.getenv("DEEPGRAM_MODEL") or "nova-3", STT_LANG, IN_RATE)
+
     tts = InworldTTSService(api_key=INW_KEY, voice_id=INW_VOICE, model="inworld-tts-2")
     llm = OpenAILLMService(base_url=LLM_BASE, api_key=LLM_KEY, model=LLM_MODEL)
 
@@ -348,13 +501,16 @@ async def main():
             logger.error("participants() fehlgeschlagen: {}", e)
             return None
 
-    def with_moh(base, allowed: bool):
-        out = dict(base or {})
-        ca = out.get("customAudio")
-        ca = dict(ca) if isinstance(ca, dict) else {"*": True}
-        ca["moh"] = allowed
-        out["customAudio"] = ca
-        return out
+    def moh_pid():
+        """Session-ID des Wartemusik-Teilnehmers (moh_agent.py)."""
+        try:
+            for p in (transport._client.participants() or {}).values():
+                info = p.get("info") or {}
+                if (info.get("userName") or "") == MOH_USER:
+                    return p.get("id") or info.get("id")
+        except Exception as e:  # noqa: BLE001
+            logger.error("moh_pid: {}", e)
+        return None
 
     async def push_perms(pid: str, perms: dict, label: str):
         try:
@@ -376,15 +532,14 @@ async def main():
             return
         base = (STATE.get("caller_perms") or {}).get("base") or {}
         if mode == "moh":
-            # alles aus, nur den Track 'moh' erlauben - ohne User-IDs (robuster)
-            base_mute = mute_base(base)
-            ca = dict(base_mute.get("customAudio") or {})
-            ca["moh"] = True
-            base_mute["customAudio"] = ca
-            perms = {"canReceive": {"base": base_mute, "byUserId": {}}, "canSend": []}
+            can = {"base": mute_base(base)}
+            mp = moh_pid()
+            if mp:
+                can["byParticipantId"] = {mp: {"microphone": True}}
+            perms = {"canReceive": can, "canSend": []}
         else:
             perms = {
-                "canReceive": {"base": with_moh(base, False), "byUserId": {}},
+                "canReceive": {"base": dict(base)},
                 "canSend": STATE.get("caller_send") or [],
             }
         await push_perms(pid, perms, f"caller/{mode}")
@@ -394,7 +549,11 @@ async def main():
         if not pid:
             return
         base = (STATE.get("chef_perms") or {}).get("base") or {}
-        perms = {"canReceive": {"base": with_moh(base, False), "byUserId": {}}}
+        can = {"base": dict(base)}
+        mp = moh_pid()
+        if mp:
+            can["byParticipantId"] = {mp: {"microphone": False}}
+        perms = {"canReceive": can}
         await push_perms(pid, perms, "chef/kein_moh")
 
     async def after_hold_spoken():
@@ -428,8 +587,11 @@ async def main():
         if accept:
             STATE["connected"] = True
             STATE["closing"] = True
-            logger.info("Chef stimmt zu -> Ansage, danach Bruecke")
-            # Anrufer bleibt auf Wartemusik, bis der Satz komplett gesprochen ist
+            logger.info("Chef stimmt zu -> Musik aus, Ansage, danach Bruecke")
+            # Anrufer muss die Ansage hoeren koennen: Rechte frei, Musik aus.
+            # Die Bruecke selbst oeffnet erst nach BotStoppedSpeaking.
+            await set_caller_hear("full")
+            moh_on(False)
             await task.queue_frames([TTSSpeakFrame(CONNECTING)])
             return
         logger.info("Chef lehnt ab -> Chef-Bein trennen")
@@ -490,10 +652,17 @@ async def main():
 
     out_gate.on_bot_stopped = on_out_bot_stopped
 
+    probe = Probe("IN")
+    vad = EnergyVAD()
+    translog = TransLog()
+
     stages = [
         transport.input(),
         in_gate,
+        probe,
+        vad,
         stt,
+        translog,
         ChefWatch(on_answer=chef_answered_yes),
         pair.user(),
         llm,
@@ -503,15 +672,17 @@ async def main():
         pair.assistant(),
     ]
     pipeline = Pipeline(stages)
-    task = PipelineTask(pipeline)
 
-    @transport.event_handler("on_joined")
-    async def on_joined(transport, data):
-        logger.info("Bot im Raum -> MOH-Track anlegen")
-        try:
-            await moh.attach(transport._client)
-        except Exception as e:  # noqa: BLE001
-            logger.error("MOH attach fehlgeschlagen: {}", e)
+    async def probe_report():
+        while True:
+            await asyncio.sleep(15)
+            if probe.audio or probe.texts:
+                rms = int((probe.sum_sq / probe.n) ** 0.5) if probe.n else 0
+                logger.info("PROBE audio_frames={} peak={} rms={} transkripte={}",
+                            probe.audio, probe.peak, rms, probe.texts)
+
+    asyncio.create_task(probe_report())
+    task = PipelineTask(pipeline)
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -520,6 +691,9 @@ async def main():
         if not pid:
             return
         info = client.get("info", {}) if isinstance(client, dict) else {}
+        if (info.get("userName") or "") == MOH_USER:
+            logger.info("Wartemusik-Teilnehmer ignoriert: {}", pid[:8])
+            return
         if info.get("isOwner"):
             # Geister-Teilnehmer eines vorherigen Bot-Starts: nicht begruessen
             logger.info("Owner-Teilnehmer ignoriert: {}", pid)
@@ -597,6 +771,8 @@ async def main():
             logger.info("SELFTEST_TTS: Opener in die Pipeline gelegt")
 
         asyncio.create_task(tts_selftest())
+
+    moh.set(False)      # keine Altlast nach Neustart
 
     await runner.run(task)
 

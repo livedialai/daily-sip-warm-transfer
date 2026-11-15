@@ -1,0 +1,16 @@
+[Unit]
+Description=Hold music participant for the Daily warm-transfer room
+After=network-online.target pipecat-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pipecat-agent
+EnvironmentFile=/opt/pipecat-agent/.env
+Environment=MOH_STATE_FILE=/tmp/moh.state
+ExecStart=/opt/pipecat-agent/venv/bin/python /opt/pipecat-agent/moh_agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
