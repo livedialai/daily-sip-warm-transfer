@@ -77,6 +77,29 @@ python scripts/sip_probe.py <carrier-ip> 5060 4930000000 pcma
 * If nobody answers within `TRANSFER_TIMEOUT_S`, the gates reopen and the agent asks the caller again.
 * `+` prefix matters: E.164 with `+` is accepted by most carriers, bare digits are often rejected with `404`.
 
+## Hold music on a separate track
+
+While the human gets the briefing, the caller should keep hearing hold music - and only the caller, not the human. Both can sit in the same Daily room, because Daily lets you publish more than one audio track and hand out permissions per track.
+
+```text
+track "microphone"  (Pipecat output)  -> TTS: greeting, hold prompt, briefing
+track "moh"         (own publisher)   -> hold music loop
+
+caller during briefing   canReceive: microphone=false, customAudio={"*": false, "moh": true}
+human during briefing    canReceive: microphone=true,  customAudio={"*": true,  "moh": false}
+caller after "yes"       canReceive: microphone=true,  customAudio={"*": true,  "moh": false}
+```
+
+Notes that cost time to find out:
+
+* `canReceive` takes a **map**, `false` is rejected (`invalid type: boolean 'false', expected a map`).
+* Inside `customAudio`/`customVideo` the `'*'` key is mandatory (`missing field '*' key`). An empty `{}` is rejected, `{"byUserId": {}}` is accepted but filters nothing.
+* Publish the extra track **when the agent joins the room**, not when the first caller connects: participants subscribe to the tracks that exist at their join, a later track never reaches them.
+* The loop is 16 kHz mono s16 (`hold16.wav`), written in 20 ms chunks; frames keep flowing as silence while the track is idle, so the publisher is not torn down between calls.
+* The file must be normalised. A loop peaking at 622/32768 (`-34 dBFS`) is inaudible on a phone line.
+
+The agent keeps the caller on hold until the closing sentence has left the pipeline (`BotStoppedSpeakingFrame`), then flips the permissions and drops the music - otherwise the caller still hears the last words.
+
 ## Diagnostics
 
 ```bash
